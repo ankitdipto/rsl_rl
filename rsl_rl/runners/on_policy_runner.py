@@ -9,6 +9,7 @@ import os
 import statistics
 import time
 import torch
+import csv
 from collections import deque
 
 import rsl_rl
@@ -131,6 +132,43 @@ class OnPolicyRunner:
         self.current_learning_iteration = 0
         self.git_status_repos = [rsl_rl.__file__]
 
+        # Initialize CSV logging for aggregate actions
+        self._init_action_csv_logging()
+
+    def _init_action_csv_logging(self):
+        """Initialize CSV file for logging aggregate actions."""
+        # Create CSV file in the root directory (where the script is run from)
+        self.action_csv_path = "aggregate_actions.csv"
+        
+        # Only initialize CSV if logging is enabled and we're the main process
+        if not self.disable_logs:
+            # Create CSV file with headers
+            with open(self.action_csv_path, 'w', newline='') as csvfile:
+                writer = csv.writer(csvfile)
+                # Write header based on number of actions
+                header = ['iteration', 'rollout_step'] + [f'mean_action_{i}' for i in range(self.env.num_actions)] + \
+                    [f'std_action_{i}' for i in range(self.env.num_actions)]
+                writer.writerow(header)
+            print(f"[INFO] Initialized action logging CSV at: {self.action_csv_path}")
+
+    def _log_aggregate_actions(self, actions: torch.Tensor, iteration: int, rollout_step: int):
+        """Log aggregate actions (averaged over all environments) to CSV.
+        
+        Args:
+            actions: Action tensor of shape (num_envs, num_actions)
+            iteration: Current learning iteration
+            rollout_step: Current step within the rollout
+        """
+        if not self.disable_logs:
+            # Compute mean actions across all environments
+            mean_actions = actions.mean(dim=0).cpu().numpy()
+            std_actions = actions.std(dim=0).cpu().numpy()
+            # Write to CSV
+            with open(self.action_csv_path, 'a', newline='') as csvfile:
+                writer = csv.writer(csvfile)
+                row = [iteration, rollout_step] + mean_actions.tolist() + std_actions.tolist()
+                writer.writerow(row)
+
     def learn(self, num_learning_iterations: int, init_at_random_ep_len: bool = False):  # noqa: C901
         # initialize writer
         if self.log_dir is not None and self.writer is None and not self.disable_logs:
@@ -199,9 +237,13 @@ class OnPolicyRunner:
             start = time.time()
             # Rollout
             with torch.inference_mode():
-                for _ in range(self.num_steps_per_env):
+                for rollout_step in range(self.num_steps_per_env):
                     # Sample actions
                     actions = self.alg.act(obs, privileged_obs)
+                    
+                    # Log aggregate actions to CSV
+                    self._log_aggregate_actions(actions, it, rollout_step)
+                    
                     # Step the environment
                     obs, rewards, dones, infos = self.env.step(actions.to(self.env.device))
                     # Move to device
@@ -313,10 +355,10 @@ class OnPolicyRunner:
                 # log to logger and terminal
                 if "/" in key:
                     self.writer.add_scalar(key, value, locs["it"])
-                    ep_string += f"""{f'{key}:':>{pad}} {value:.4f}\n"""
+                    ep_string += f"""{f'{key}:':>{pad}} {value:.8f}\n"""
                 else:
                     self.writer.add_scalar("Episode/" + key, value, locs["it"])
-                    ep_string += f"""{f'Mean episode {key}:':>{pad}} {value:.4f}\n"""
+                    ep_string += f"""{f'Mean episode {key}:':>{pad}} {value:.8f}\n"""
 
         mean_std = self.alg.policy.action_std.mean()
         fps = int(collection_size / (locs["collection_time"] + locs["learn_time"]))

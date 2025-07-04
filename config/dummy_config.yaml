@@ -60,6 +60,35 @@ algorithm:
     # if 0, then no symmetry loss is used
     mirror_loss_coeff: 0.0
 
+  # -- Mirror Symmetry Loss (Yu et al. approach)
+  mirror_symmetry_cfg:
+    enabled: false  # enable/disable mirror symmetry loss
+    weight: 4.0     # coefficient for mirror symmetry loss (default from Yu et al. paper)
+    
+    # Define symmetric joint pairs [left_joint_idx, right_joint_idx]
+    # Example for a humanoid robot:
+    symmetric_joint_pairs: []
+    # - [0, 3]   # left_hip_yaw, right_hip_yaw
+    # - [1, 4]   # left_hip_roll, right_hip_roll  
+    # - [2, 5]   # left_hip_pitch, right_hip_pitch
+    # - [6, 9]   # left_knee, right_knee
+    # - [7, 10]  # left_ankle_pitch, right_ankle_pitch
+    # - [8, 11]  # left_ankle_roll, right_ankle_roll
+    
+    # Observation indices that should be sign-flipped when mirrored (e.g., lateral velocities)
+    symmetric_obs_indices: []
+    # - 13  # lateral velocity
+    # - 14  # angular velocity around z-axis
+    
+    # Action indices that should be swapped when mirrored
+    symmetric_action_indices: []
+    # - [0, 3]   # left_hip_yaw, right_hip_yaw
+    # - [1, 4]   # left_hip_roll, right_hip_roll  
+    # - [2, 5]   # left_hip_pitch, right_hip_pitch
+    # - [6, 9]   # left_knee, right_knee
+    # - [7, 10]  # left_ankle_pitch, right_ankle_pitch
+    # - [8, 11]  # left_ankle_roll, right_ankle_roll
+
 policy:
   class_name: ActorCritic
   # for MLP i.e. `ActorCritic`

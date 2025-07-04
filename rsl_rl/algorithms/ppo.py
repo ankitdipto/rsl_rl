@@ -43,6 +43,8 @@ class PPO:
         rnd_cfg: dict | None = None,
         # Symmetry parameters
         symmetry_cfg: dict | None = None,
+        # Mirror symmetry parameters (Yu et al. approach)
+        mirror_symmetry_cfg: dict | None = None,
         # Distributed training parameters
         multi_gpu_cfg: dict | None = None,
     ):
@@ -90,6 +92,21 @@ class PPO:
             self.symmetry = symmetry_cfg
         else:
             self.symmetry = None
+
+        # Mirror symmetry components (Yu et al. approach)
+        if mirror_symmetry_cfg is not None:
+            self.mirror_symmetry = {
+                'enabled': mirror_symmetry_cfg.get('enabled', False),
+                'weight': mirror_symmetry_cfg.get('weight', 4.0),  # default from Yu et al. paper
+                'symmetric_joint_pairs': mirror_symmetry_cfg.get('symmetric_joint_pairs', []),
+                'symmetric_obs_indices': mirror_symmetry_cfg.get('symmetric_obs_indices', []), 
+                'symmetric_action_indices': mirror_symmetry_cfg.get('symmetric_action_indices', [])
+            }
+            if self.mirror_symmetry['enabled']:
+                print(f"Mirror symmetry loss enabled with weight: {self.mirror_symmetry['weight']}")
+                print(f"Symmetric joint pairs: {len(self.mirror_symmetry['symmetric_joint_pairs'])}")
+        else:
+            self.mirror_symmetry = None
 
         # PPO components
         self.policy = policy
@@ -199,6 +216,11 @@ class PPO:
             mean_symmetry_loss = 0
         else:
             mean_symmetry_loss = None
+        # -- Mirror symmetry loss (Yu et al. approach)
+        if self.mirror_symmetry and self.mirror_symmetry['enabled']:
+            mean_mirror_symmetry_loss = 0
+        else:
+            mean_mirror_symmetry_loss = None
 
         # generator for mini batches
         if self.policy.is_recurrent:
@@ -325,6 +347,12 @@ class PPO:
 
             loss = surrogate_loss + self.value_loss_coef * value_loss - self.entropy_coef * entropy_batch.mean()
 
+            # Mirror symmetry loss (Yu et al. approach)
+            mirror_symmetry_loss = torch.tensor(0.0, device=self.device)
+            if self.mirror_symmetry and self.mirror_symmetry['enabled']:
+                mirror_symmetry_loss = self.compute_mirror_symmetry_loss(obs_batch)
+                loss += self.mirror_symmetry['weight'] * mirror_symmetry_loss
+
             # Symmetry loss
             if self.symmetry:
                 # obtain the symmetric actions
@@ -400,6 +428,9 @@ class PPO:
             # -- Symmetry loss
             if mean_symmetry_loss is not None:
                 mean_symmetry_loss += symmetry_loss.item()
+            # -- Mirror symmetry loss
+            if mean_mirror_symmetry_loss is not None:
+                mean_mirror_symmetry_loss += mirror_symmetry_loss.item()
 
         # -- For PPO
         num_updates = self.num_learning_epochs * self.num_mini_batches
@@ -412,6 +443,9 @@ class PPO:
         # -- For Symmetry
         if mean_symmetry_loss is not None:
             mean_symmetry_loss /= num_updates
+        # -- For Mirror Symmetry
+        if mean_mirror_symmetry_loss is not None:
+            mean_mirror_symmetry_loss /= num_updates
         # -- Clear the storage
         self.storage.clear()
 
@@ -425,8 +459,98 @@ class PPO:
             loss_dict["rnd"] = mean_rnd_loss
         if self.symmetry:
             loss_dict["symmetry"] = mean_symmetry_loss
+        if self.mirror_symmetry and self.mirror_symmetry['enabled']:
+            loss_dict["mirror_symmetry"] = mean_mirror_symmetry_loss
 
         return loss_dict
+
+    def mirror_observations(self, obs_batch):
+        """
+        Mirror observations by swapping symmetric components.
+        
+        Args:
+            obs_batch: Batch of observations [batch_size, obs_dim]
+            
+        Returns:
+            mirrored_obs: Mirrored observations [batch_size, obs_dim]
+        """
+        mirrored_obs = obs_batch.clone()
+        
+        # Swap symmetric joint pairs
+        for left_idx, right_idx in self.mirror_symmetry['symmetric_joint_pairs']:
+            mirrored_obs[:, left_idx], mirrored_obs[:, right_idx] = \
+                obs_batch[:, right_idx], obs_batch[:, left_idx]
+        
+        # Flip sign for specific observation indices (e.g., lateral velocities)
+        for idx in self.mirror_symmetry['symmetric_obs_indices']:
+            mirrored_obs[:, idx] *= -1
+        
+        return mirrored_obs
+
+    def mirror_actions(self, actions_batch):
+        """
+        Mirror actions by swapping symmetric components.
+        
+        Args:
+            actions_batch: Batch of actions [batch_size, action_dim]
+            
+        Returns:
+            mirrored_actions: Mirrored actions [batch_size, action_dim]
+        """
+        mirrored_actions = actions_batch.clone()
+        
+        # Swap symmetric action pairs
+        for left_idx, right_idx in self.mirror_symmetry['symmetric_action_indices']:
+            mirrored_actions[:, left_idx], mirrored_actions[:, right_idx] = \
+                actions_batch[:, right_idx], actions_batch[:, left_idx]
+        
+        return mirrored_actions
+
+    def compute_mirror_symmetry_loss(self, obs_batch):
+        """
+        Compute mirror symmetry loss as in Yu et al. paper.
+        
+        Mathematical formulation:
+        L_sym(θ) = Σ(i=0 to B) ||π_θ(s_i) - Ψ_a(π_θ(Ψ_o(s_i)))||²
+        
+        Where:
+        - π_θ(s_i): policy output for original state
+        - Ψ_o(s_i): mirror transformation of state
+        - π_θ(Ψ_o(s_i)): policy output for mirrored state  
+        - Ψ_a(π_θ(Ψ_o(s_i))): mirror transformation of policy output from mirrored state
+        
+        Args:
+            obs_batch: Batch of observations [batch_size, obs_dim]
+            
+        Returns:
+            symmetry_loss: Mirror symmetry loss scalar
+        """
+        
+        # Step 1: π_θ(s_i) - Get policy actions for original observations
+        # This corresponds to π_θ(s_i) in the equation
+        original_policy_actions = self.policy.act_inference(obs_batch)
+        
+        # Step 2: Ψ_o(s_i) - Mirror the observations  
+        # This corresponds to Ψ_o(s_i) in the equation
+        mirrored_obs = self.mirror_observations(obs_batch)
+        
+        # Step 3: π_θ(Ψ_o(s_i)) - Get policy actions for mirrored observations
+        # This corresponds to π_θ(Ψ_o(s_i)) in the equation
+        policy_actions_from_mirrored_obs = self.policy.act_inference(mirrored_obs)
+        
+        # Step 4: Ψ_a(π_θ(Ψ_o(s_i))) - Mirror the policy actions from mirrored observations
+        # This corresponds to Ψ_a(π_θ(Ψ_o(s_i))) in the equation
+        mirrored_policy_actions_from_mirrored_obs = self.mirror_actions(policy_actions_from_mirrored_obs)
+        
+        # Step 5: ||π_θ(s_i) - Ψ_a(π_θ(Ψ_o(s_i)))||² - Compute MSE loss
+        # This is the complete loss term from the equation
+        mse_loss = torch.nn.MSELoss()
+        symmetry_loss = mse_loss(
+            original_policy_actions,                           # π_θ(s_i)
+            mirrored_policy_actions_from_mirrored_obs.detach() # Ψ_a(π_θ(Ψ_o(s_i)))
+        )
+        
+        return symmetry_loss
 
     """
     Helper functions
