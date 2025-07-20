@@ -234,6 +234,10 @@ class OnPolicyRunner:
         # Start training
         start_iter = self.current_learning_iteration
         tot_iter = start_iter + num_learning_iterations
+
+        # Extract the pure IsaacLab environment
+        pure_env = self.env.unwrapped.unwrapped
+
         for it in range(start_iter, tot_iter):
             
             if it >= 0.7 * tot_iter and self.alg.mirror_symmetry['weight'] != 1.0: # Setting the mirror symmetry weight to 1.0 after 70% of the training
@@ -258,7 +262,7 @@ class OnPolicyRunner:
                     actions = self.alg.act(obs, privileged_obs)
                     
                     # Log aggregate actions to CSV
-                    self._log_aggregate_actions(actions, it, rollout_step)
+                    # self._log_aggregate_actions(actions, it, rollout_step)
                     
                     # Step the environment
                     obs, rewards, dones, infos = self.env.step(actions.to(self.env.device))
@@ -297,6 +301,12 @@ class OnPolicyRunner:
                         # Clear data for completed episodes
                         # -- common
                         new_ids = (dones > 0).nonzero(as_tuple=False)
+                        # print("new_ids: ", new_ids)
+                        # Terminate/exit the program if new_ids is not empty
+                        # if new_ids.numel() > 0:
+                        #     print(f"Terminating program: Found {new_ids.numel()} completed environments at iteration {it}")
+                        #     exit()
+
                         rewbuffer.extend(cur_reward_sum[new_ids][:, 0].cpu().numpy().tolist())
                         lenbuffer.extend(cur_episode_length[new_ids][:, 0].cpu().numpy().tolist())
                         cur_reward_sum[new_ids] = 0
@@ -321,6 +331,95 @@ class OnPolicyRunner:
 
             stop = time.time()
             learn_time = stop - start
+
+            # Evaluate policy
+            if False and it > 0 and it % 2000 == 0:
+                print(f"Beginning policy evaluation at iteration {it}")
+                deltaV = 0.02
+                # First get an inference policy
+                inf_policy = self.get_inference_policy(device=self.device)
+                velocity_hist = []
+                robots_data = pure_env.scene["robot"].data
+                with torch.inference_mode():
+                    for rollout_step in tqdm(range(self.env.max_episode_length)):
+                        # print(f"Inference rollout step: {rollout_step}")
+                        # sample actions
+                        actions = inf_policy(obs)
+                        # step the environment
+                        obs, rewards, dones, infos = self.env.step(actions.to(self.env.device))
+                        # Extract the robot's base velocity
+                        base_vel = robots_data.root_lin_vel_b.clone().detach().cpu()
+
+                        assert base_vel.shape == (self.env.num_envs, 3)
+
+                        # Store only the x-component of the velocity
+                        velocity_hist.append(base_vel[:, 0])
+
+                        # move to device
+                        # obs, rewards, dones = (obs.to(self.device), rewards.to(self.device), dones.to(self.device))
+                        # perform normalization
+                        # obs = self.obs_normalizer(obs)
+                        # if self.privileged_obs_type is not None:
+                        #     privileged_obs = self.privileged_obs_normalizer(
+                        #         infos["observations"][self.privileged_obs_type].to(self.device)
+                        #     )
+                        # else:
+                        #     privileged_obs = obs
+                        # # process the step
+                        # self.alg.process_env_step(rewards, dones, infos)
+                
+                velocity_hist_tch = torch.stack(velocity_hist)
+                median_vel, _ = velocity_hist_tch.median(dim=0)
+                mean_median_vel = median_vel.mean()
+                
+                # Curriculum Update stage
+
+                # Step 1: Extract the command manager from the pure environment
+                command_manager = pure_env.command_manager
+                # Step 2: Extract the command term from the command manager
+                command_term = command_manager.get_term("base_velocity")
+
+                # Step 3: Extract the current command velocity as a tensor over all the environments
+                curr_cmd_vel_x = command_term.cfg.ranges.lin_vel_x[0]
+                
+                if mean_median_vel >= curr_cmd_vel_x:
+                    with open(os.path.join(self.log_dir, "curriculum_analysis.txt"), "a") as f:                                            
+                        f.write(f"Current iteration: {it}\n")
+                        f.write(f"median_vel: {median_vel[:60]}\n") # Logging the median velocity for only the first 60 envs to avoid truncation
+                        f.write(f"mean_median_vel: {mean_median_vel}\n")
+                        f.write(f"curr_cmd_vel_x: {curr_cmd_vel_x}\n")
+                        f.write(f"Increasing the command velocity to {curr_cmd_vel_x + deltaV}\n")
+                        f.write("------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------\n")
+                    
+                    command_term.cfg.ranges.lin_vel_x = (curr_cmd_vel_x + deltaV, curr_cmd_vel_x + deltaV)
+                    self.save(os.path.join(self.log_dir, f"model_itr({it})_medVel({mean_median_vel}).pt"))
+
+                # Step 5: Update the command velocity
+
+                # Step 3: Extract the current command velocity as a tensor over all the environments
+                #curr_cmd_vel_x = torch.full((len(rewbuffer), 1), command_term.cfg.ranges.lin_vel_x[0])
+                # Step 4: Organise the current rewards as a tensor over all the environments
+                #curr_rews = torch.tensor(rewbuffer)
+            
+                # Step 5: Extract the sigma from the Reward Manager
+                #reward_manager = pure_env.reward_manager
+                #track_lin_vel_xy_base_exp_term = reward_manager.get_term_cfg("track_lin_vel_xy_base_exp")
+                #sigma = track_lin_vel_xy_base_exp_term.params["std"]
+
+                # Step 6: Compute the base velocity of the robots in all the environments
+                    # r = exp(-(Vb - Vc)^2 / sigma^2)
+                    # -> log r = - (Vb - Vc)^2 / sigma^2
+                    # -> - (Vb - Vc)^2 = log r * sigma^2
+                    # -> (Vb - Vc)^2 = - log r * sigma^2
+                    # -> (Vb - Vc)^2 = log(1/r) * sigma^2
+                    # -> Vb - Vc = sqrt(log(1/r) * sigma^2)
+                    # -> Vb = Vc + sqrt(log(1/r) * sigma^2)
+                # curr_base_vel_x = curr_cmd_vel_x + torch.sqrt(torch.log(1/curr_rews) * sigma**2)
+                # print("curr_cmd_vel_x: ", curr_cmd_vel_x)
+                # print("curr_rews: ", curr_rews)
+                # print("sigma: ", sigma)
+                # print("curr_base_vel_x: ", curr_base_vel_x)
+
             self.current_learning_iteration = it
             # log info
             if self.log_dir is not None and not self.disable_logs:
@@ -402,6 +501,10 @@ class OnPolicyRunner:
             # everything else
             self.writer.add_scalar("Train/mean_reward", statistics.mean(locs["rewbuffer"]), locs["it"])
             self.writer.add_scalar("Train/mean_episode_length", statistics.mean(locs["lenbuffer"]), locs["it"])
+            # log the mean median velocity if it exists
+            if "mean_median_vel" in locs:
+                print(f"Logging mean median velocity: {locs['mean_median_vel']}")
+                self.writer.add_scalar("Train/mean_median_velocity", locs["mean_median_vel"], locs["it"])
             if self.logger_type != "wandb":  # wandb does not support non-integer x-axis logging
                 self.writer.add_scalar("Train/mean_reward/time", statistics.mean(locs["rewbuffer"]), self.tot_time)
                 self.writer.add_scalar(
