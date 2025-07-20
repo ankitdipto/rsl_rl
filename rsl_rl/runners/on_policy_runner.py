@@ -11,6 +11,7 @@ import time
 import torch
 import csv
 from collections import deque
+from tqdm import tqdm
 
 import rsl_rl
 from rsl_rl.algorithms import PPO, Distillation
@@ -234,6 +235,21 @@ class OnPolicyRunner:
         start_iter = self.current_learning_iteration
         tot_iter = start_iter + num_learning_iterations
         for it in range(start_iter, tot_iter):
+            
+            if it >= 0.7 * tot_iter and self.alg.mirror_symmetry['weight'] != 1.0: # Setting the mirror symmetry weight to 1.0 after 70% of the training
+                print(f"Trying to set mirror symmetry weight to 1.0 at iteration {it}")
+                self.alg.mirror_symmetry['weight'] = 1.0
+                print(self.alg.mirror_symmetry)
+            # if it == 2: # I am trying to update the command velocity at the second iteration on the algorithm side (not environment side)
+                
+            #     # I will extract the command manager from the pure environment
+            #     command_manager = pure_env.command_manager
+            #     # Then I will extract the command term from the command manager
+            #     command_term = command_manager.get_term("base_velocity")
+            #     # Then I will update the command velocity
+            #     command_term.cfg.ranges.lin_vel_x = (0.30, 0.40)
+            #     command_manager._terms["base_velocity"] = command_term
+
             start = time.time()
             # Rollout
             with torch.inference_mode():
