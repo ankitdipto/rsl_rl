@@ -12,6 +12,7 @@ import torch
 import csv
 from collections import deque
 from tqdm import tqdm
+import copy
 
 import rsl_rl
 from rsl_rl.algorithms import PPO, Distillation
@@ -217,6 +218,10 @@ class OnPolicyRunner:
         cur_reward_sum = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
         cur_episode_length = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
 
+        # Create variables to store the best checkpoint and the best reward as the training progresses
+        best_checkpoint = None
+        best_reward = -float('inf')
+
         # create buffers for logging extrinsic and intrinsic rewards
         if self.alg.rnd:
             erewbuffer = deque(maxlen=100)
@@ -240,10 +245,10 @@ class OnPolicyRunner:
 
         for it in range(start_iter, tot_iter):
             
-            if it >= 0.7 * tot_iter and self.alg.mirror_symmetry['weight'] != 1.0: # Setting the mirror symmetry weight to 1.0 after 70% of the training
-                print(f"Trying to set mirror symmetry weight to 1.0 at iteration {it}")
-                self.alg.mirror_symmetry['weight'] = 1.0
-                print(self.alg.mirror_symmetry)
+            # if it >= 0.7 * tot_iter and self.alg.mirror_symmetry['weight'] != 1.0: # Setting the mirror symmetry weight to 1.0 after 70% of the training
+            #     print(f"Trying to set mirror symmetry weight to 1.0 at iteration {it}")
+            #     self.alg.mirror_symmetry['weight'] = 1.0
+            #     print(self.alg.mirror_symmetry)
             # if it == 2: # I am trying to update the command velocity at the second iteration on the algorithm side (not environment side)
                 
             #     # I will extract the command manager from the pure environment
@@ -325,6 +330,21 @@ class OnPolicyRunner:
                 # compute returns
                 if self.training_type == "rl":
                     self.alg.compute_returns(privileged_obs)
+
+            # Compare and save the best checkpoint so far
+            try:
+                curr_reward = statistics.mean(rewbuffer)
+                if curr_reward > best_reward:
+                    best_reward = curr_reward
+                    best_checkpoint = {
+                        "model_state_dict": copy.deepcopy(self.alg.policy.state_dict()),
+                        "optimizer_state_dict": copy.deepcopy(self.alg.optimizer.state_dict()),
+                        "iter": it,
+                        "infos": None
+                    }
+            except:
+                print(f"Error computing mean reward at iteration {it}")
+                curr_reward = 0
 
             # update policy
             loss_dict = self.alg.update()
@@ -443,6 +463,10 @@ class OnPolicyRunner:
         # Save the final model after training
         if self.log_dir is not None and not self.disable_logs:
             self.save(os.path.join(self.log_dir, f"model_{self.current_learning_iteration}.pt"))
+
+        # Save the best checkpoint after training
+        if best_checkpoint is not None:
+            torch.save(best_checkpoint, os.path.join(self.log_dir, "model_best.pt"))
 
     def log(self, locs: dict, width: int = 80, pad: int = 35):
         # Compute the collection size
