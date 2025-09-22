@@ -243,8 +243,40 @@ class OnPolicyRunner:
         # Extract the pure IsaacLab environment
         pure_env = self.env.unwrapped.unwrapped
 
+        # Store the original weights of the reward terms
+        rew_manager = pure_env.reward_manager
+
+        pos_track_term_idx = rew_manager._term_names.index("position_tracking_l1_singleObj")
+        forward_vel_x_term_idx = rew_manager._term_names.index("forward_vel_base")
+        jump_term_idx = rew_manager._term_names.index("high_jump")
+
+        pos_tracking_weight = rew_manager._term_cfgs[pos_track_term_idx].weight
+        forward_vel_x_weight = rew_manager._term_cfgs[forward_vel_x_term_idx].weight
+        jump_weight = rew_manager._term_cfgs[jump_term_idx].weight
+
+        rew_manager._term_cfgs[pos_track_term_idx].weight = 0.0
+        rew_manager._term_cfgs[forward_vel_x_term_idx].weight = 4.0
+        rew_manager._term_cfgs[jump_term_idx].weight = 0.0
+
+        # Ramp weights linearly from iteration 150 to 300
+        ramp_start = 150
+        ramp_end = 300
+        ramp_span = max(1, ramp_end - ramp_start)
+
         for it in range(start_iter, tot_iter):
-            
+            if ramp_start <= it <= ramp_end:
+                # compute ramp factor in [0,1]
+                t = (it - ramp_start) / ramp_span
+                # ramp weights from initial (0/4.0) towards their original values
+                rew_manager._term_cfgs[pos_track_term_idx].weight = pos_tracking_weight * t
+                rew_manager._term_cfgs[forward_vel_x_term_idx].weight = 4.0 + (forward_vel_x_weight - 4.0) * t
+                rew_manager._term_cfgs[jump_term_idx].weight = jump_weight * t
+            elif it > ramp_end:
+                # after ramp, restore original target weights
+                rew_manager._term_cfgs[pos_track_term_idx].weight = pos_tracking_weight
+                rew_manager._term_cfgs[forward_vel_x_term_idx].weight = forward_vel_x_weight
+                rew_manager._term_cfgs[jump_term_idx].weight = jump_weight
+
             # if it >= 0.7 * tot_iter and self.alg.mirror_symmetry['weight'] != 1.0: # Setting the mirror symmetry weight to 1.0 after 70% of the training
             #     print(f"Trying to set mirror symmetry weight to 1.0 at iteration {it}")
             #     self.alg.mirror_symmetry['weight'] = 1.0
