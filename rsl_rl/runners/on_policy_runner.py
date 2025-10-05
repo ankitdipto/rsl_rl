@@ -221,6 +221,7 @@ class OnPolicyRunner:
         # Create variables to store the best checkpoint and the best reward as the training progresses
         best_checkpoint = None
         best_reward = -float('inf')
+        best_crclm_level = 0.0
 
         # create buffers for logging extrinsic and intrinsic rewards
         if self.alg.rnd:
@@ -246,6 +247,10 @@ class OnPolicyRunner:
         # Store the original weights of the reward terms
         rew_manager = pure_env.reward_manager
 
+        F = 4.0
+        J = 0.0
+        P = 0.0
+
         pos_track_term_idx = rew_manager._term_names.index("position_tracking_l1_singleObj")
         forward_vel_x_term_idx = rew_manager._term_names.index("forward_vel_base")
         jump_term_idx = rew_manager._term_names.index("high_jump")
@@ -254,24 +259,25 @@ class OnPolicyRunner:
         forward_vel_x_weight = rew_manager._term_cfgs[forward_vel_x_term_idx].weight
         jump_weight = rew_manager._term_cfgs[jump_term_idx].weight
 
-        rew_manager._term_cfgs[pos_track_term_idx].weight = 0.0
-        rew_manager._term_cfgs[forward_vel_x_term_idx].weight = 4.0
-        rew_manager._term_cfgs[jump_term_idx].weight = 0.0
+        rew_manager._term_cfgs[pos_track_term_idx].weight = P
+        rew_manager._term_cfgs[forward_vel_x_term_idx].weight = F
+        rew_manager._term_cfgs[jump_term_idx].weight = J
 
         # Ramp weights linearly from iteration 150 to 300
         ramp_start = 150
-        ramp_end = 300
+        ramp_end = 400
         ramp_span = max(1, ramp_end - ramp_start)
+        ramp_enabled = True
 
         for it in range(start_iter, tot_iter):
-            if ramp_start <= it <= ramp_end:
+            if ramp_enabled and ramp_start <= it <= ramp_end:
                 # compute ramp factor in [0,1]
                 t = (it - ramp_start) / ramp_span
                 # ramp weights from initial (0/4.0) towards their original values
                 rew_manager._term_cfgs[pos_track_term_idx].weight = pos_tracking_weight * t
-                rew_manager._term_cfgs[forward_vel_x_term_idx].weight = 4.0 + (forward_vel_x_weight - 4.0) * t
+                rew_manager._term_cfgs[forward_vel_x_term_idx].weight = F + (forward_vel_x_weight - F) * t
                 rew_manager._term_cfgs[jump_term_idx].weight = jump_weight * t
-            elif it > ramp_end:
+            elif ramp_enabled and it > ramp_end:
                 # after ramp, restore original target weights
                 rew_manager._term_cfgs[pos_track_term_idx].weight = pos_tracking_weight
                 rew_manager._term_cfgs[forward_vel_x_term_idx].weight = forward_vel_x_weight
@@ -365,19 +371,24 @@ class OnPolicyRunner:
 
             # Compare and save the best checkpoint so far
             try:
-                curr_reward = statistics.mean(rewbuffer)
-                if curr_reward > best_reward:
-                    best_reward = curr_reward
+                # curr_reward = statistics.mean(rewbuffer)
+                curr_crclm_level = infos["log"]["Curriculum/obstacle_height_levels_custom"]
+                if curr_crclm_level > best_crclm_level:
+                    best_crclm_level = curr_crclm_level
                     best_checkpoint = {
                         "model_state_dict": copy.deepcopy(self.alg.policy.state_dict()),
                         "optimizer_state_dict": copy.deepcopy(self.alg.optimizer.state_dict()),
                         "iter": it,
-                        "infos": None
+                        "infos": infos,
+                        "best_crclm_level": curr_crclm_level
                     }
+                    torch.save(best_checkpoint,
+                    os.path.join(self.log_dir, "model_best.pt"))
             except:
-                print(f"Error computing mean reward at iteration {it}")
-                curr_reward = 0
-
+                # print(f"Error computing mean reward at iteration {it}")
+                # curr_reward = 0
+                print(f"Error extracting current curriculum level at iteration {it}")
+            
             # update policy
             loss_dict = self.alg.update()
 
