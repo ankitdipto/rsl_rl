@@ -219,10 +219,16 @@ class OnPolicyRunner:
         cur_episode_length = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
 
         # Create variables to store the best checkpoint and the best reward as the training progresses
-        best_checkpoint = None
         best_reward = -float('inf')
         best_crclm_level = -1.0
-
+        best_checkpoint = {
+            "model_state_dict": copy.deepcopy(self.alg.policy.state_dict()),
+            "optimizer_state_dict": copy.deepcopy(self.alg.optimizer.state_dict()),
+            "iter": -1,
+            "infos": None,
+            "best_crclm_level": best_crclm_level
+        }
+        
         # create buffers for logging extrinsic and intrinsic rewards
         if self.alg.rnd:
             erewbuffer = deque(maxlen=100)
@@ -301,67 +307,71 @@ class OnPolicyRunner:
             start = time.time()
             # Rollout
             with torch.inference_mode():
-                for rollout_step in range(self.num_steps_per_env):
-                    # Sample actions
-                    actions = self.alg.act(obs, privileged_obs)
-                    
-                    # Log aggregate actions to CSV
-                    # self._log_aggregate_actions(actions, it, rollout_step)
-                    
-                    # Step the environment
-                    obs, rewards, dones, infos = self.env.step(actions.to(self.env.device))
-                    # Move to device
-                    obs, rewards, dones = (obs.to(self.device), rewards.to(self.device), dones.to(self.device))
-                    # perform normalization
-                    obs = self.obs_normalizer(obs)
-                    if self.privileged_obs_type is not None:
-                        privileged_obs = self.privileged_obs_normalizer(
-                            infos["observations"][self.privileged_obs_type].to(self.device)
-                        )
-                    else:
-                        privileged_obs = obs
-
-                    # process the step
-                    self.alg.process_env_step(rewards, dones, infos)
-
-                    # Extract intrinsic rewards (only for logging)
-                    intrinsic_rewards = self.alg.intrinsic_rewards if self.alg.rnd else None
-
-                    # book keeping
-                    if self.log_dir is not None:
-                        if "episode" in infos:
-                            ep_infos.append(infos["episode"])
-                        elif "log" in infos:
-                            ep_infos.append(infos["log"])
-                        # Update rewards
-                        if self.alg.rnd:
-                            cur_ereward_sum += rewards
-                            cur_ireward_sum += intrinsic_rewards  # type: ignore
-                            cur_reward_sum += rewards + intrinsic_rewards
+                try:
+                    for rollout_step in range(self.num_steps_per_env):
+                        # Sample actions
+                        actions = self.alg.act(obs, privileged_obs)
+                        
+                        # Log aggregate actions to CSV
+                        # self._log_aggregate_actions(actions, it, rollout_step)
+                        
+                        # Step the environment
+                        obs, rewards, dones, infos = self.env.step(actions.to(self.env.device))
+                        # Move to device
+                        obs, rewards, dones = (obs.to(self.device), rewards.to(self.device), dones.to(self.device))
+                        # perform normalization
+                        obs = self.obs_normalizer(obs)
+                        if self.privileged_obs_type is not None:
+                            privileged_obs = self.privileged_obs_normalizer(
+                                infos["observations"][self.privileged_obs_type].to(self.device)
+                            )
                         else:
-                            cur_reward_sum += rewards
-                        # Update episode length
-                        cur_episode_length += 1
-                        # Clear data for completed episodes
-                        # -- common
-                        new_ids = (dones > 0).nonzero(as_tuple=False)
-                        # print("new_ids: ", new_ids)
-                        # Terminate/exit the program if new_ids is not empty
-                        # if new_ids.numel() > 0:
-                        #     print(f"Terminating program: Found {new_ids.numel()} completed environments at iteration {it}")
-                        #     exit()
+                            privileged_obs = obs
 
-                        rewbuffer.extend(cur_reward_sum[new_ids][:, 0].cpu().numpy().tolist())
-                        lenbuffer.extend(cur_episode_length[new_ids][:, 0].cpu().numpy().tolist())
-                        cur_reward_sum[new_ids] = 0
-                        cur_episode_length[new_ids] = 0
-                        # -- intrinsic and extrinsic rewards
-                        if self.alg.rnd:
-                            erewbuffer.extend(cur_ereward_sum[new_ids][:, 0].cpu().numpy().tolist())
-                            irewbuffer.extend(cur_ireward_sum[new_ids][:, 0].cpu().numpy().tolist())
-                            cur_ereward_sum[new_ids] = 0
-                            cur_ireward_sum[new_ids] = 0
+                        # process the step
+                        self.alg.process_env_step(rewards, dones, infos)
 
+                        # Extract intrinsic rewards (only for logging)
+                        intrinsic_rewards = self.alg.intrinsic_rewards if self.alg.rnd else None
+
+                        # book keeping
+                        if self.log_dir is not None:
+                            if "episode" in infos:
+                                ep_infos.append(infos["episode"])
+                            elif "log" in infos:
+                                ep_infos.append(infos["log"])
+                            # Update rewards
+                            if self.alg.rnd:
+                                cur_ereward_sum += rewards
+                                cur_ireward_sum += intrinsic_rewards  # type: ignore
+                                cur_reward_sum += rewards + intrinsic_rewards
+                            else:
+                                cur_reward_sum += rewards
+                            # Update episode length
+                            cur_episode_length += 1
+                            # Clear data for completed episodes
+                            # -- common
+                            new_ids = (dones > 0).nonzero(as_tuple=False)
+                            # print("new_ids: ", new_ids)
+                            # Terminate/exit the program if new_ids is not empty
+                            # if new_ids.numel() > 0:
+                            #     print(f"Terminating program: Found {new_ids.numel()} completed environments at iteration {it}")
+                            #     exit()
+
+                            rewbuffer.extend(cur_reward_sum[new_ids][:, 0].cpu().numpy().tolist())
+                            lenbuffer.extend(cur_episode_length[new_ids][:, 0].cpu().numpy().tolist())
+                            cur_reward_sum[new_ids] = 0
+                            cur_episode_length[new_ids] = 0
+                            # -- intrinsic and extrinsic rewards
+                            if self.alg.rnd:
+                                erewbuffer.extend(cur_ereward_sum[new_ids][:, 0].cpu().numpy().tolist())
+                                irewbuffer.extend(cur_ireward_sum[new_ids][:, 0].cpu().numpy().tolist())
+                                cur_ereward_sum[new_ids] = 0
+                                cur_ireward_sum[new_ids] = 0
+                except Exception as e:
+                    torch.save(best_checkpoint, os.path.join(self.log_dir, "model_best.pt"))
+                    raise
+                
                 stop = time.time()
                 collection_time = stop - start
                 start = stop
@@ -509,8 +519,7 @@ class OnPolicyRunner:
             self.save(os.path.join(self.log_dir, f"model_{self.current_learning_iteration}.pt"))
 
         # Save the best checkpoint after training
-        if best_checkpoint is not None:
-            torch.save(best_checkpoint, os.path.join(self.log_dir, "model_best.pt"))
+        torch.save(best_checkpoint, os.path.join(self.log_dir, "model_best.pt"))
 
     def log(self, locs: dict, width: int = 80, pad: int = 35):
         # Compute the collection size
