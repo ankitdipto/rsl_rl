@@ -393,8 +393,6 @@ class OnPolicyRunner:
                         "infos": infos,
                         "best_crclm_level": curr_crclm_level
                     }
-                    torch.save(best_checkpoint,
-                    os.path.join(self.log_dir, "model_best.pt"))
             except:
                 # print(f"Error computing mean reward at iteration {it}")
                 # curr_reward = 0
