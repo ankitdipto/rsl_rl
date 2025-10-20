@@ -228,6 +228,14 @@ class OnPolicyRunner:
             "infos": None,
             "best_crclm_level": best_crclm_level
         }
+        if self.empirical_normalization:
+            best_checkpoint.update({
+                    "obs_norm_state_dict": copy.deepcopy(self.obs_normalizer.state_dict()),
+                    "privileged_obs_norm_state_dict": copy.deepcopy(self.privileged_obs_normalizer.state_dict()),
+                }
+            )
+            
+        torch.save(best_checkpoint, os.path.join(self.log_dir, "model_best.pt"))
         
         # create buffers for logging extrinsic and intrinsic rewards
         if self.alg.rnd:
@@ -393,6 +401,12 @@ class OnPolicyRunner:
                         "infos": infos,
                         "best_crclm_level": curr_crclm_level
                     }
+                    if self.empirical_normalization:
+                        best_checkpoint.update({
+                                "obs_norm_state_dict": copy.deepcopy(self.obs_normalizer.state_dict()),
+                                "privileged_obs_norm_state_dict": copy.deepcopy(self.privileged_obs_normalizer.state_dict()),
+                            }
+                        )
             except:
                 # print(f"Error computing mean reward at iteration {it}")
                 # curr_reward = 0
@@ -500,6 +514,7 @@ class OnPolicyRunner:
                 # Save model
                 if it % self.save_interval == 0:
                     self.save(os.path.join(self.log_dir, f"model_{it}.pt"))
+                    torch.save(best_checkpoint, os.path.join(self.log_dir, "model_best.pt"))
 
             # Clear episode infos
             ep_infos.clear()
