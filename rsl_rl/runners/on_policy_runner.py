@@ -298,10 +298,10 @@ class OnPolicyRunner:
             #     rew_manager._term_cfgs[forward_vel_x_term_idx].weight = forward_vel_x_weight
             #     rew_manager._term_cfgs[jump_term_idx].weight = jump_weight
 
-            # if it >= 0.7 * tot_iter and self.alg.mirror_symmetry['weight'] != 1.0: # Setting the mirror symmetry weight to 1.0 after 70% of the training
-            #     print(f"Trying to set mirror symmetry weight to 1.0 at iteration {it}")
-            #     self.alg.mirror_symmetry['weight'] = 1.0
-            #     print(self.alg.mirror_symmetry)
+            if it >= 0.3 * tot_iter and self.alg.mirror_symmetry['weight'] != 0.1: # Setting the mirror symmetry weight to 1.0 after 70% of the training
+                print(f"Trying to set mirror symmetry weight to 1.0 at iteration {it}")
+                self.alg.mirror_symmetry['weight'] = 0.1
+                print(self.alg.mirror_symmetry)
             # if it == 2: # I am trying to update the command velocity at the second iteration on the algorithm side (not environment side)
                 
             #     # I will extract the command manager from the pure environment
