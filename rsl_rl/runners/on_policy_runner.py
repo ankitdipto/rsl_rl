@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import statistics
 import time
@@ -21,6 +22,7 @@ from rsl_rl.modules import (
     ActorCritic,
     ActorCriticRecurrent,
     EmpiricalNormalization,
+    MoEActorCritic,
     StudentTeacher,
     StudentTeacherRecurrent,
 )
@@ -72,9 +74,12 @@ class OnPolicyRunner:
 
         # evaluate the policy class
         policy_class = eval(self.policy_cfg.pop("class_name"))
-        policy: ActorCritic | ActorCriticRecurrent | StudentTeacher | StudentTeacherRecurrent = policy_class(
+        policy: ActorCritic | ActorCriticRecurrent | MoEActorCritic | StudentTeacher | StudentTeacherRecurrent = policy_class(
             num_obs, num_privileged_obs, self.env.num_actions, **self.policy_cfg
         ).to(self.device)
+        
+        # Check if using MoE policy
+        self.use_moe = isinstance(policy, MoEActorCritic)
 
         # resolve dimension of rnd gated state
         if "rnd_cfg" in self.alg_cfg and self.alg_cfg["rnd_cfg"] is not None:
@@ -122,6 +127,18 @@ class OnPolicyRunner:
             [num_privileged_obs],
             [self.env.num_actions],
         )
+        
+        # Initialize MoE expert tracking if using MoE policy
+        if self.use_moe:
+            self.alg.policy.init_expert_tracking(self.env.num_envs, self.device)
+            # Gate probs logging configuration (read from moe_cfg if available)
+            moe_cfg = self.alg_cfg.get("moe_cfg", {}) or {}
+            self.gate_probs_log_interval = moe_cfg.get("gate_probs_log_interval", 3)
+            self.gate_probs_num_envs = min(
+                moe_cfg.get("gate_probs_num_envs", 4),
+                self.env.num_envs
+            )
+            self.gate_probs_log_file = None  # Will be set when log_dir is available
 
         # Decide whether to disable logging
         # We only log from the process with rank 0 (main process)
@@ -298,10 +315,10 @@ class OnPolicyRunner:
             #     rew_manager._term_cfgs[forward_vel_x_term_idx].weight = forward_vel_x_weight
             #     rew_manager._term_cfgs[jump_term_idx].weight = jump_weight
 
-            if it >= 0.3 * tot_iter and self.alg.mirror_symmetry['weight'] != 0.1: # Setting the mirror symmetry weight to 1.0 after 70% of the training
-                print(f"Trying to set mirror symmetry weight to 1.0 at iteration {it}")
-                self.alg.mirror_symmetry['weight'] = 0.1
-                print(self.alg.mirror_symmetry)
+            # if it >= 0.3 * tot_iter and self.alg.mirror_symmetry['weight'] != 0.1: # Setting the mirror symmetry weight to 1.0 after 70% of the training
+            #     print(f"Trying to set mirror symmetry weight to 1.0 at iteration {it}")
+            #     self.alg.mirror_symmetry['weight'] = 0.1
+            #     print(self.alg.mirror_symmetry)
             # if it == 2: # I am trying to update the command velocity at the second iteration on the algorithm side (not environment side)
                 
             #     # I will extract the command manager from the pure environment
@@ -315,6 +332,10 @@ class OnPolicyRunner:
             start = time.time()
             # Rollout
             with torch.inference_mode():
+                # Commit experts for this rollout (MoE only)
+                if self.use_moe:
+                    self.alg.policy.sample_and_commit_experts(obs, current_iter=it)
+                
                 try:
                     for rollout_step in range(self.num_steps_per_env):
                         # Sample actions
@@ -414,6 +435,11 @@ class OnPolicyRunner:
             
             # update policy
             loss_dict = self.alg.update()
+            
+            # Anneal MoE temperature and clear committed experts
+            if self.use_moe:
+                self.alg.policy.anneal_temperature()
+                self.alg.policy.clear_committed_experts()
 
             stop = time.time()
             learn_time = stop - start
@@ -511,6 +537,9 @@ class OnPolicyRunner:
             if self.log_dir is not None and not self.disable_logs:
                 # Log information
                 self.log(locals())
+                # Log gate probabilities for MoE visualization
+                if self.use_moe and it % self.gate_probs_log_interval == 0:
+                    self._log_gate_probs(it, obs)
                 # Save model
                 if it % self.save_interval == 0:
                     self.save(os.path.join(self.log_dir, f"model_{it}.pt"))
@@ -588,6 +617,12 @@ class OnPolicyRunner:
                 self.writer.add_scalar("Rnd/mean_extrinsic_reward", statistics.mean(locs["erewbuffer"]), locs["it"])
                 self.writer.add_scalar("Rnd/mean_intrinsic_reward", statistics.mean(locs["irewbuffer"]), locs["it"])
                 self.writer.add_scalar("Rnd/weight", self.alg.rnd.weight, locs["it"])
+            # MoE logging
+            if self.use_moe:
+                self.writer.add_scalar("MoE/temperature", self.alg.policy.tau, locs["it"])
+                expert_utilization = self.alg.policy.get_expert_utilization()
+                for i, count in enumerate(expert_utilization):
+                    self.writer.add_scalar(f"MoE/expert_{i}_count", count.item(), locs["it"])
             # everything else
             self.writer.add_scalar("Train/mean_reward", statistics.mean(locs["rewbuffer"]), locs["it"])
             self.writer.add_scalar("Train/mean_episode_length", statistics.mean(locs["lenbuffer"]), locs["it"])
@@ -649,6 +684,63 @@ class OnPolicyRunner:
             )}\n"""
         )
         print(log_string)
+
+    def _log_gate_probs(self, iteration: int, obs: torch.Tensor):
+        """Log gate probabilities for visualization.
+        
+        Logs gate probs and morphology vectors for the first N environments
+        to a JSONL file for real-time visualization.
+        
+        Args:
+            iteration: Current training iteration.
+            obs: Current observations tensor of shape (num_envs, obs_dim).
+        """
+        # Initialize log file if not done yet
+        if self.gate_probs_log_file is None:
+            self.gate_probs_log_file = os.path.join(self.log_dir, "gate_probs.jsonl")
+            # Write header info (number of experts, morphology dim, etc.)
+            header = {
+                "type": "header",
+                "num_experts": self.alg.policy.num_experts,
+                "num_morphology_obs": self.alg.policy.num_morphology_obs,
+                "num_envs_logged": self.gate_probs_num_envs,
+                "routing_type": self.alg.policy.routing_type,
+            }
+            with open(self.gate_probs_log_file, "w") as f:
+                f.write(json.dumps(header) + "\n")
+        
+        # Get gate probabilities for the first N envs
+        policy = self.alg.policy
+        num_envs = self.gate_probs_num_envs
+        num_morph = policy.num_morphology_obs
+        
+        # Extract morphology from observations (last num_morph dims)
+        morphology = obs[:num_envs, -num_morph:].detach().cpu()
+        
+        # Compute gate logits and probabilities
+        with torch.no_grad():
+            gate_logits = policy.gate(obs[:num_envs, -num_morph:]).cpu()
+            gate_probs = torch.softmax(gate_logits, dim=-1)
+            u = torch.rand_like(gate_logits)
+            gumbel_noise = -torch.log(-torch.log(u + 1e-10) + 1e-10)
+            
+        # Build log entry
+        entry = {
+            "type": "data",
+            "iteration": iteration,
+            "temperature": policy.tau,
+        }
+        
+        # Add per-environment data
+        for env_idx in range(num_envs):
+            entry[f"env_{env_idx}_gate_logits"] = gate_logits[env_idx].tolist()
+            entry[f"env_{env_idx}_gate_probs"] = gate_probs[env_idx].tolist()
+            entry[f"env_{env_idx}_morphology"] = morphology[env_idx].tolist()
+            entry[f"env_{env_idx}_gumbel_noise"] = gumbel_noise[env_idx].tolist()
+        
+        # Append to log file
+        with open(self.gate_probs_log_file, "a") as f:
+            f.write(json.dumps(entry) + "\n")
 
     def save(self, path: str, infos=None):
         # -- Save model

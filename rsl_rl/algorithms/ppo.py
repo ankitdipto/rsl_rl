@@ -10,7 +10,7 @@ import torch.nn as nn
 import torch.optim as optim
 from itertools import chain
 
-from rsl_rl.modules import ActorCritic
+from rsl_rl.modules import ActorCritic, MoEActorCritic
 from rsl_rl.modules.rnd import RandomNetworkDistillation
 from rsl_rl.storage import RolloutStorage
 from rsl_rl.utils import string_to_callable
@@ -19,7 +19,7 @@ from rsl_rl.utils import string_to_callable
 class PPO:
     """Proximal Policy Optimization algorithm (https://arxiv.org/abs/1707.06347)."""
 
-    policy: ActorCritic
+    policy: ActorCritic | MoEActorCritic
     """The actor critic module."""
 
     def __init__(
@@ -47,6 +47,8 @@ class PPO:
         mirror_symmetry_cfg: dict | None = None,
         # Distributed training parameters
         multi_gpu_cfg: dict | None = None,
+        # MoE parameters
+        moe_cfg: dict | None = None,
     ):
         # device-related parameters
         self.device = device
@@ -108,6 +110,30 @@ class PPO:
         else:
             self.mirror_symmetry = None
 
+        # MoE (Mixture of Experts) components
+        self.use_moe = isinstance(policy, MoEActorCritic)
+        if moe_cfg is not None:
+            self.moe_cfg = {
+                'num_morphology_obs': moe_cfg.get('num_morphology_obs', 11),
+                'routing_type': moe_cfg.get('routing_type', 'soft'),
+                'load_balance_coef': moe_cfg.get('load_balance_coef', 0.01),
+            }
+        elif self.use_moe:
+            # Use defaults from policy if MoE but no config provided
+            self.moe_cfg = {
+                'num_morphology_obs': policy.num_morphology_obs,
+                'routing_type': policy.routing_type,
+                'load_balance_coef': policy.load_balance_coef,
+            }
+        else:
+            self.moe_cfg = None
+        
+        if self.use_moe:
+            print(f"MoE policy detected with {policy.num_experts} experts")
+            print(f"  Routing type: {self.moe_cfg['routing_type']}")
+            print(f"  Morphology obs dim: {self.moe_cfg['num_morphology_obs']}")
+            print(f"  Load balance coef: {self.moe_cfg['load_balance_coef']}")
+
         # PPO components
         self.policy = policy
         self.policy.to(self.device)
@@ -140,6 +166,8 @@ class PPO:
             rnd_state_shape = [self.rnd.num_states]
         else:
             rnd_state_shape = None
+        # For MoE hard routing, we need to store expert indices
+        use_hard_moe = self.use_moe and self.moe_cfg.get('routing_type', 'soft') == 'hard'
         # create rollout storage
         self.storage = RolloutStorage(
             training_type,
@@ -149,6 +177,7 @@ class PPO:
             critic_obs_shape,
             actions_shape,
             rnd_state_shape,
+            use_hard_moe,
             self.device,
         )
 
@@ -164,6 +193,11 @@ class PPO:
         # need to record obs and critic_obs before env.step()
         self.transition.observations = obs
         self.transition.privileged_observations = critic_obs
+        
+        # For MoE hard routing, store expert indices for consistent update
+        if self.use_moe and self.moe_cfg.get('routing_type', 'soft') == 'hard':
+            self.transition.expert_indices = self.policy.current_expert_indices.detach()
+        
         return self.transition.actions
 
     def process_env_step(self, rewards, dones, infos):
@@ -221,6 +255,13 @@ class PPO:
             mean_mirror_symmetry_loss = 0
         else:
             mean_mirror_symmetry_loss = None
+        # -- MoE load balance loss
+        if self.use_moe:
+            mean_moe_load_balance_loss = 0
+            mean_moe_diversity_loss = 0
+        else:
+            mean_moe_load_balance_loss = None
+            mean_moe_diversity_loss = None
 
         # generator for mini batches
         if self.policy.is_recurrent:
@@ -242,6 +283,7 @@ class PPO:
             hid_states_batch,
             masks_batch,
             rnd_state_batch,
+            expert_indices_batch,  # None for soft MoE or non-MoE
         ) in generator:
 
             # number of augmentations per sample
@@ -279,7 +321,19 @@ class PPO:
             # Recompute actions log prob and entropy for current batch of transitions
             # Note: we need to do this because we updated the policy with the new parameters
             # -- actor
-            self.policy.act(obs_batch, masks=masks_batch, hidden_states=hid_states_batch[0])
+            if self.use_moe:
+                num_morph = self.moe_cfg['num_morphology_obs']
+                morphology_batch = obs_batch[:, -num_morph:]
+                actor_obs_batch = obs_batch[:, :-num_morph]
+                
+                if self.moe_cfg.get('routing_type', 'soft') == 'hard' and expert_indices_batch is not None:
+                    # Hard routing: use stored expert indices for consistency with rollout
+                    self.policy.act_for_update_hard(actor_obs_batch, morphology_batch, expert_indices_batch)
+                else:
+                    # Soft routing: same weighted combination as rollout
+                    self.policy.act_for_update(actor_obs_batch, morphology_batch)
+            else:
+                self.policy.act(obs_batch, masks=masks_batch, hidden_states=hid_states_batch[0])
             actions_log_prob_batch = self.policy.get_actions_log_prob(actions_batch)
             # -- critic
             value_batch = self.policy.evaluate(critic_obs_batch, masks=masks_batch, hidden_states=hid_states_batch[1])
@@ -352,6 +406,41 @@ class PPO:
             if self.mirror_symmetry and self.mirror_symmetry['enabled']:
                 mirror_symmetry_loss = self.compute_mirror_symmetry_loss(obs_batch)
                 loss += self.mirror_symmetry['weight'] * mirror_symmetry_loss
+
+            # MoE load balancing loss
+            moe_load_balance_loss = torch.tensor(0.0, device=self.device)
+            if self.use_moe:
+                # Use the gate probs computed during forward pass for load balancing
+                # (stored in self.policy._last_gate_probs by forward_all_experts_soft)
+                if self.policy._last_gate_probs is not None:
+                    moe_load_balance_loss = self.policy.compute_load_balance_loss()
+                    loss += self.moe_cfg['load_balance_coef'] * moe_load_balance_loss
+
+            # MoE diversity loss (top-2 cosine repulsion on expert action means)
+            moe_diversity_loss = torch.tensor(0.0, device=self.device)
+            if self.use_moe and self.moe_cfg.get("routing_type", "soft") == "hard":
+                div_coef = float(getattr(self.policy, "diversity_coef", 0.0))
+                div_eps = float(getattr(self.policy, "diversity_eps", 1.0e-8))
+                if div_coef > 0.0:
+                    # Compute per-expert means: (B, E, A)
+                    expert_means = self.policy.compute_all_expert_means(actor_obs_batch, morphology_batch)
+
+                    # Pick top-2 experts by gate logits for each sample: (B, 2)
+                    gate_logits = self.policy.gate(morphology_batch)
+                    top2 = gate_logits.topk(k=2, dim=-1).indices
+
+                    bsz = expert_means.shape[0]
+                    batch_idx = torch.arange(bsz, device=expert_means.device)
+                    mu1 = expert_means[batch_idx, top2[:, 0], :]
+                    mu2 = expert_means[batch_idx, top2[:, 1], :]
+
+                    # Cosine similarity squared (bounded, scale-stable)
+                    mu1 = mu1 / (mu1.norm(dim=-1, keepdim=True) + div_eps)
+                    mu2 = mu2 / (mu2.norm(dim=-1, keepdim=True) + div_eps)
+                    cos = (mu1 * mu2).sum(dim=-1)  # (B,)
+                    moe_diversity_loss = (cos ** 2).mean()
+
+                    loss += div_coef * moe_diversity_loss
 
             # Symmetry loss
             if self.symmetry:
@@ -431,6 +520,12 @@ class PPO:
             # -- Mirror symmetry loss
             if mean_mirror_symmetry_loss is not None:
                 mean_mirror_symmetry_loss += mirror_symmetry_loss.item()
+            # -- MoE load balance loss
+            if mean_moe_load_balance_loss is not None:
+                mean_moe_load_balance_loss += moe_load_balance_loss.item()
+            # -- MoE diversity loss
+            if mean_moe_diversity_loss is not None:
+                mean_moe_diversity_loss += moe_diversity_loss.item()
 
         # -- For PPO
         num_updates = self.num_learning_epochs * self.num_mini_batches
@@ -446,6 +541,12 @@ class PPO:
         # -- For Mirror Symmetry
         if mean_mirror_symmetry_loss is not None:
             mean_mirror_symmetry_loss /= num_updates
+        # -- For MoE load balance
+        if mean_moe_load_balance_loss is not None:
+            mean_moe_load_balance_loss /= num_updates
+        # -- For MoE diversity
+        if mean_moe_diversity_loss is not None:
+            mean_moe_diversity_loss /= num_updates
         # -- Clear the storage
         self.storage.clear()
 
@@ -461,6 +562,9 @@ class PPO:
             loss_dict["symmetry"] = mean_symmetry_loss
         if self.mirror_symmetry and self.mirror_symmetry['enabled']:
             loss_dict["mirror_symmetry"] = mean_mirror_symmetry_loss
+        if self.use_moe:
+            loss_dict["moe_load_balance"] = mean_moe_load_balance_loss
+            loss_dict["moe_diversity"] = mean_moe_diversity_loss
 
         return loss_dict
 

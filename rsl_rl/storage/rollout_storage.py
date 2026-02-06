@@ -25,6 +25,8 @@ class RolloutStorage:
             self.action_sigma = None
             self.hidden_states = None
             self.rnd_state = None
+            # MoE hard routing: store which expert was selected during rollout
+            self.expert_indices = None
 
         def clear(self):
             self.__init__()
@@ -38,6 +40,7 @@ class RolloutStorage:
         privileged_obs_shape,
         actions_shape,
         rnd_state_shape=None,
+        use_hard_moe=False,
         device="cpu",
     ):
         # store inputs
@@ -48,6 +51,7 @@ class RolloutStorage:
         self.obs_shape = obs_shape
         self.privileged_obs_shape = privileged_obs_shape
         self.rnd_state_shape = rnd_state_shape
+        self.use_hard_moe = use_hard_moe
         self.actions_shape = actions_shape
 
         # Core
@@ -78,6 +82,12 @@ class RolloutStorage:
         # For RND
         if rnd_state_shape is not None:
             self.rnd_state = torch.zeros(num_transitions_per_env, num_envs, *rnd_state_shape, device=self.device)
+
+        # For MoE hard routing - store which expert was selected during rollout
+        if use_hard_moe:
+            self.expert_indices = torch.zeros(num_transitions_per_env, num_envs, dtype=torch.long, device=self.device)
+        else:
+            self.expert_indices = None
 
         # For RNN networks
         self.saved_hidden_states_a = None
@@ -113,6 +123,10 @@ class RolloutStorage:
         # For RND
         if self.rnd_state_shape is not None:
             self.rnd_state[self.step].copy_(transition.rnd_state)
+
+        # For MoE hard routing
+        if self.use_hard_moe and transition.expert_indices is not None:
+            self.expert_indices[self.step].copy_(transition.expert_indices)
 
         # For RNN networks
         self._save_hidden_states(transition.hidden_states)
@@ -209,6 +223,10 @@ class RolloutStorage:
         if self.rnd_state_shape is not None:
             rnd_state = self.rnd_state.flatten(0, 1)
 
+        # For MoE hard routing
+        if self.use_hard_moe:
+            expert_indices = self.expert_indices.flatten(0, 1)
+
         for epoch in range(num_epochs):
             for i in range(num_mini_batches):
                 # Select the indices for the mini-batch
@@ -236,11 +254,17 @@ class RolloutStorage:
                 else:
                     rnd_state_batch = None
 
+                # -- For MoE hard routing
+                if self.use_hard_moe:
+                    expert_indices_batch = expert_indices[batch_idx]
+                else:
+                    expert_indices_batch = None
+
                 # yield the mini-batch
                 yield obs_batch, privileged_observations_batch, actions_batch, target_values_batch, advantages_batch, returns_batch, old_actions_log_prob_batch, old_mu_batch, old_sigma_batch, (
                     None,
                     None,
-                ), None, rnd_state_batch
+                ), None, rnd_state_batch, expert_indices_batch
 
     # for reinfrocement learning with recurrent networks
     def recurrent_mini_batch_generator(self, num_mini_batches, num_epochs=8):
