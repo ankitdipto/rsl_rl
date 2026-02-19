@@ -102,8 +102,8 @@ class MoEActorCritic(nn.Module):
         self.diversity_eps = float(diversity_eps)
         self.diversity_coef: float = 0.0
         
-        assert routing_type in ("soft", "hard"), (
-            f"routing_type must be 'soft' or 'hard', got '{routing_type}'"
+        assert routing_type in ("soft", "hard", "fixed"), (
+            f"routing_type must be 'soft', 'hard', or 'fixed', got '{routing_type}'"
         )
         assert num_morphology_obs <= num_actor_obs, (
             f"num_morphology_obs ({num_morphology_obs}) must be <= num_actor_obs ({num_actor_obs})"
@@ -184,7 +184,7 @@ class MoEActorCritic(nn.Module):
         print(f"  Full obs dim: {num_actor_obs} (base: {self.num_base_obs}, morph: {num_morphology_obs})")
         print(f"  Expert input dim: {expert_input_dim}")
         print(f"  Expert architecture: {actor_hidden_dims} -> {num_actions}")
-        print(f"  Critic: {self.critic}")
+        #print(f"  Critic: {self.critic}")
         print(f"  Temperature: initial={tau_initial}, min={tau_min}, anneal_rate={tau_anneal_rate}")
 
     def init_expert_tracking(self, num_envs: int, device: torch.device):
@@ -241,6 +241,12 @@ class MoEActorCritic(nn.Module):
         if self.routing_type == "hard":
             # Sample using Gumbel-softmax
             _, expert_indices = self.gumbel_softmax_hard(gate_logits)
+            self.committed_expert_indices = expert_indices.detach()
+            self.committed_gate_weights = None
+        elif self.routing_type == "fixed":
+            # Use cluster ID from the last dimension of morphology
+            expert_indices = morphology[:, -1].long()
+            # print(f"[DEBUG] sampled expert indices: {expert_indices[:10]}")
             self.committed_expert_indices = expert_indices.detach()
             self.committed_gate_weights = None
         else:  # soft
@@ -458,6 +464,54 @@ class MoEActorCritic(nn.Module):
         
         return weighted_output
 
+    def forward_all_experts_fixed(
+        self, 
+        observations: torch.Tensor, 
+        morphology: torch.Tensor,
+    ) -> torch.Tensor:
+        """Forward pass through experts using fixed cluster-based gating.
+        
+        The last dimension of the morphology vector is expected to be the cluster ID.
+        This ID is used to select the expert for each sample.
+        
+        Args:
+            observations: Base observations (without morphology) of shape (batch, base_obs_dim).
+            morphology: Morphology vectors of shape (batch, morph_dim).
+                        The last dimension is the cluster ID.
+            
+        Returns:
+            action_means: Shape (batch, action_dim), output from selected expert only.
+        """
+        # Use committed indices if available (rollout), otherwise extract from morphology (update)
+        if self.experts_committed and self.committed_expert_indices is not None:
+            cluster_ids = self.committed_expert_indices
+        else:
+            cluster_ids = morphology[:, -1].long()
+        
+        # Concatenate observations and morphology for expert input
+        expert_input = torch.cat([observations, morphology], dim=-1)
+        
+        # Track expert indices for logging
+        # if self.current_expert_indices is not None and cluster_ids.shape[0] == self.current_expert_indices.shape[0]:
+        #    self.current_expert_indices = cluster_ids.detach()
+        # print(f"[DEBUG] Current expert indices: {self.current_expert_indices}")
+        #print(f"[DEBUG] Cluster IDs: {cluster_ids}")
+        # assert self.current_expert_indices == cluster_ids, "Current expert indices do not match cluster IDs"
+        # Optimized forward pass: only run each expert on its assigned samples
+        batch_size = observations.size(0)
+        device = observations.device
+        outputs = torch.zeros(batch_size, self.num_actions, device=device)
+        #print(f"[DEBUG] current expert indices: {self.current_expert_indices[:10]}")
+        # print("[DEBUG] Shape of input to experts: ", expert_input.shape)
+        for expert_idx in range(self.num_experts):
+            mask = (cluster_ids == expert_idx)
+            #print(f"[DEBUG] Shape of mask for expert {expert_idx}: {mask.shape}")
+            if mask.any():
+                # Only pass the masked subset of inputs to the corresponding expert
+                outputs[mask] = self.experts[expert_idx](expert_input[mask])
+
+        return outputs
+
     def forward_single_expert(
         self, 
         observations: torch.Tensor, 
@@ -514,6 +568,8 @@ class MoEActorCritic(nn.Module):
         # Forward through experts based on routing type
         if self.routing_type == "soft":
             mean = self.forward_all_experts_soft(actor_obs, morphology)
+        elif self.routing_type == "fixed":
+            mean = self.forward_all_experts_fixed(actor_obs, morphology)
         else:  # hard
             mean = self.forward_all_experts_hard(actor_obs, morphology, use_gumbel_noise=True)
         
@@ -560,10 +616,15 @@ class MoEActorCritic(nn.Module):
         if self.routing_type == "soft":
             # Soft weighted combination (same as training)
             return self.forward_all_experts_soft(actor_obs, morphology)
+        elif self.routing_type == "fixed":
+            # Fixed cluster-based gating
+            return self.forward_all_experts_fixed(actor_obs, morphology)
         else:  # hard
             # Deterministic selection via argmax (efficient - only runs selected expert)
             gate_logits = self.gate(morphology)
             expert_indices = gate_logits.argmax(dim=-1)
+            # I want to force expert 2 for now
+            expert_indices = torch.full_like(expert_indices, 3)
             
             # Track expert indices for logging
             if self.current_expert_indices is not None and expert_indices.shape[0] == self.current_expert_indices.shape[0]:
@@ -599,6 +660,8 @@ class MoEActorCritic(nn.Module):
         # Forward through experts based on routing type
         if self.routing_type == "soft":
             mean = self.forward_all_experts_soft(observations, morphology)
+        elif self.routing_type == "fixed":
+            mean = self.forward_all_experts_fixed(observations, morphology)
         else:  # hard
             # Use deterministic selection (no Gumbel noise) but still straight-through
             # This ensures consistency with rollout while allowing gate gradients
@@ -716,6 +779,13 @@ class MoEActorCritic(nn.Module):
         Returns:
             Value estimates of shape (batch, 1).
         """
+        # cluster_ids = critic_observations[:, -1].long()
+        # values = torch.full((critic_observations.size(0), 1), fill_value=float('nan'), device=critic_observations.device)
+        # for expert_idx in range(self.num_experts):
+        #     mask = (cluster_ids == expert_idx)
+        #     if mask.any():
+        #         values[mask] = self.critics[expert_idx](critic_observations[mask])
+        # return values
         return self.critic(critic_observations)
 
     def reset(self, dones: torch.Tensor | None = None):

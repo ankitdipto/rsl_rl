@@ -167,7 +167,7 @@ class PPO:
         else:
             rnd_state_shape = None
         # For MoE hard routing, we need to store expert indices
-        use_hard_moe = self.use_moe and self.moe_cfg.get('routing_type', 'soft') == 'hard'
+        use_hard_moe = self.use_moe and self.moe_cfg.get('routing_type', 'soft') in ['hard', 'fixed']
         # create rollout storage
         self.storage = RolloutStorage(
             training_type,
@@ -195,7 +195,7 @@ class PPO:
         self.transition.privileged_observations = critic_obs
         
         # For MoE hard routing, store expert indices for consistent update
-        if self.use_moe and self.moe_cfg.get('routing_type', 'soft') == 'hard':
+        if self.use_moe and self.moe_cfg.get('routing_type', 'soft') in ['hard', 'fixed']:
             self.transition.expert_indices = self.policy.current_expert_indices.detach()
         
         return self.transition.actions
@@ -326,11 +326,11 @@ class PPO:
                 morphology_batch = obs_batch[:, -num_morph:]
                 actor_obs_batch = obs_batch[:, :-num_morph]
                 
-                if self.moe_cfg.get('routing_type', 'soft') == 'hard' and expert_indices_batch is not None:
+                if self.moe_cfg.get('routing_type') in ['hard', 'fixed'] and expert_indices_batch is not None:
                     # Hard routing: use stored expert indices for consistency with rollout
                     self.policy.act_for_update_hard(actor_obs_batch, morphology_batch, expert_indices_batch)
                 else:
-                    # Soft routing: same weighted combination as rollout
+                    # Soft/Fixed routing: same weighted combination as rollout
                     self.policy.act_for_update(actor_obs_batch, morphology_batch)
             else:
                 self.policy.act(obs_batch, masks=masks_batch, hidden_states=hid_states_batch[0])
@@ -418,7 +418,7 @@ class PPO:
 
             # MoE diversity loss (top-2 cosine repulsion on expert action means)
             moe_diversity_loss = torch.tensor(0.0, device=self.device)
-            if self.use_moe and self.moe_cfg.get("routing_type", "soft") == "hard":
+            if self.use_moe and self.moe_cfg.get("routing_type") in ["hard", "fixed"]:
                 div_coef = float(getattr(self.policy, "diversity_coef", 0.0))
                 div_eps = float(getattr(self.policy, "diversity_eps", 1.0e-8))
                 if div_coef > 0.0:

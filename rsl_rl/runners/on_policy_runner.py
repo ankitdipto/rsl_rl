@@ -23,6 +23,7 @@ from rsl_rl.modules import (
     ActorCriticRecurrent,
     EmpiricalNormalization,
     MoEActorCritic,
+    SpecialistActorCritic,
     StudentTeacher,
     StudentTeacherRecurrent,
 )
@@ -74,7 +75,14 @@ class OnPolicyRunner:
 
         # evaluate the policy class
         policy_class = eval(self.policy_cfg.pop("class_name"))
-        policy: ActorCritic | ActorCriticRecurrent | MoEActorCritic | StudentTeacher | StudentTeacherRecurrent = policy_class(
+        policy: (
+            ActorCritic
+            | ActorCriticRecurrent
+            | MoEActorCritic
+            | SpecialistActorCritic
+            | StudentTeacher
+            | StudentTeacherRecurrent
+        ) = policy_class(
             num_obs, num_privileged_obs, self.env.num_actions, **self.policy_cfg
         ).to(self.device)
         
@@ -275,59 +283,12 @@ class OnPolicyRunner:
         # Extract the pure IsaacLab environment
         pure_env = self.env.unwrapped.unwrapped
 
-        # Store the original weights of the reward terms
-        # rew_manager = pure_env.reward_manager
-
-        # F = 4.0
-        # J = 0.0
-        # P = 0.0
-
-        # pos_track_term_idx = rew_manager._term_names.index("position_tracking_l1_singleObj")
-        # forward_vel_x_term_idx = rew_manager._term_names.index("forward_vel_base")
-        # jump_term_idx = rew_manager._term_names.index("high_jump")
-
-        # pos_tracking_weight = rew_manager._term_cfgs[pos_track_term_idx].weight
-        # forward_vel_x_weight = rew_manager._term_cfgs[forward_vel_x_term_idx].weight
-        # jump_weight = rew_manager._term_cfgs[jump_term_idx].weight
-
-        # rew_manager._term_cfgs[pos_track_term_idx].weight = P
-        # rew_manager._term_cfgs[forward_vel_x_term_idx].weight = F
-        # rew_manager._term_cfgs[jump_term_idx].weight = J
-
-        # Ramp weights linearly from iteration 150 to 300
-        # ramp_start = 50
-        # ramp_end = 200
-        # ramp_span = max(1, ramp_end - ramp_start)
-        # ramp_enabled = False
-
         for it in range(start_iter, tot_iter):
             pure_env.rsl_rl_iteration = it
-            # if ramp_enabled and ramp_start <= it <= ramp_end:
-            #     # compute ramp factor in [0,1]
-            #     t = (it - ramp_start) / ramp_span
-            #     # ramp weights from initial (0/4.0) towards their original values
-            #     rew_manager._term_cfgs[pos_track_term_idx].weight = pos_tracking_weight * t
-            #     rew_manager._term_cfgs[forward_vel_x_term_idx].weight = F + (forward_vel_x_weight - F) * t
-            #     rew_manager._term_cfgs[jump_term_idx].weight = jump_weight * t
-            # elif ramp_enabled and it > ramp_end:
-            #     # after ramp, restore original target weights
-            #     rew_manager._term_cfgs[pos_track_term_idx].weight = pos_tracking_weight
-            #     rew_manager._term_cfgs[forward_vel_x_term_idx].weight = forward_vel_x_weight
-            #     rew_manager._term_cfgs[jump_term_idx].weight = jump_weight
-
             # if it >= 0.3 * tot_iter and self.alg.mirror_symmetry['weight'] != 0.1: # Setting the mirror symmetry weight to 1.0 after 70% of the training
             #     print(f"Trying to set mirror symmetry weight to 1.0 at iteration {it}")
             #     self.alg.mirror_symmetry['weight'] = 0.1
             #     print(self.alg.mirror_symmetry)
-            # if it == 2: # I am trying to update the command velocity at the second iteration on the algorithm side (not environment side)
-                
-            #     # I will extract the command manager from the pure environment
-            #     command_manager = pure_env.command_manager
-            #     # Then I will extract the command term from the command manager
-            #     command_term = command_manager.get_term("base_velocity")
-            #     # Then I will update the command velocity
-            #     command_term.cfg.ranges.lin_vel_x = (0.30, 0.40)
-            #     command_manager._terms["base_velocity"] = command_term
 
             start = time.time()
             # Rollout
@@ -444,94 +405,6 @@ class OnPolicyRunner:
             stop = time.time()
             learn_time = stop - start
 
-            # Evaluate policy
-            if False and it > 0 and it % 2000 == 0:
-                print(f"Beginning policy evaluation at iteration {it}")
-                deltaV = 0.02
-                # First get an inference policy
-                inf_policy = self.get_inference_policy(device=self.device)
-                velocity_hist = []
-                robots_data = pure_env.scene["robot"].data
-                with torch.inference_mode():
-                    for rollout_step in tqdm(range(self.env.max_episode_length)):
-                        # print(f"Inference rollout step: {rollout_step}")
-                        # sample actions
-                        actions = inf_policy(obs)
-                        # step the environment
-                        obs, rewards, dones, infos = self.env.step(actions.to(self.env.device))
-                        # Extract the robot's base velocity
-                        base_vel = robots_data.root_lin_vel_b.clone().detach().cpu()
-
-                        assert base_vel.shape == (self.env.num_envs, 3)
-
-                        # Store only the x-component of the velocity
-                        velocity_hist.append(base_vel[:, 0])
-
-                        # move to device
-                        # obs, rewards, dones = (obs.to(self.device), rewards.to(self.device), dones.to(self.device))
-                        # perform normalization
-                        # obs = self.obs_normalizer(obs)
-                        # if self.privileged_obs_type is not None:
-                        #     privileged_obs = self.privileged_obs_normalizer(
-                        #         infos["observations"][self.privileged_obs_type].to(self.device)
-                        #     )
-                        # else:
-                        #     privileged_obs = obs
-                        # # process the step
-                        # self.alg.process_env_step(rewards, dones, infos)
-                
-                velocity_hist_tch = torch.stack(velocity_hist)
-                median_vel, _ = velocity_hist_tch.median(dim=0)
-                mean_median_vel = median_vel.mean()
-                
-                # Curriculum Update stage
-
-                # Step 1: Extract the command manager from the pure environment
-                command_manager = pure_env.command_manager
-                # Step 2: Extract the command term from the command manager
-                command_term = command_manager.get_term("base_velocity")
-
-                # Step 3: Extract the current command velocity as a tensor over all the environments
-                curr_cmd_vel_x = command_term.cfg.ranges.lin_vel_x[0]
-                
-                if mean_median_vel >= curr_cmd_vel_x:
-                    with open(os.path.join(self.log_dir, "curriculum_analysis.txt"), "a") as f:                                            
-                        f.write(f"Current iteration: {it}\n")
-                        f.write(f"median_vel: {median_vel[:60]}\n") # Logging the median velocity for only the first 60 envs to avoid truncation
-                        f.write(f"mean_median_vel: {mean_median_vel}\n")
-                        f.write(f"curr_cmd_vel_x: {curr_cmd_vel_x}\n")
-                        f.write(f"Increasing the command velocity to {curr_cmd_vel_x + deltaV}\n")
-                        f.write("------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------\n")
-                    
-                    command_term.cfg.ranges.lin_vel_x = (curr_cmd_vel_x + deltaV, curr_cmd_vel_x + deltaV)
-                    self.save(os.path.join(self.log_dir, f"model_itr({it})_medVel({mean_median_vel}).pt"))
-
-                # Step 5: Update the command velocity
-
-                # Step 3: Extract the current command velocity as a tensor over all the environments
-                #curr_cmd_vel_x = torch.full((len(rewbuffer), 1), command_term.cfg.ranges.lin_vel_x[0])
-                # Step 4: Organise the current rewards as a tensor over all the environments
-                #curr_rews = torch.tensor(rewbuffer)
-            
-                # Step 5: Extract the sigma from the Reward Manager
-                #reward_manager = pure_env.reward_manager
-                #track_lin_vel_xy_base_exp_term = reward_manager.get_term_cfg("track_lin_vel_xy_base_exp")
-                #sigma = track_lin_vel_xy_base_exp_term.params["std"]
-
-                # Step 6: Compute the base velocity of the robots in all the environments
-                    # r = exp(-(Vb - Vc)^2 / sigma^2)
-                    # -> log r = - (Vb - Vc)^2 / sigma^2
-                    # -> - (Vb - Vc)^2 = log r * sigma^2
-                    # -> (Vb - Vc)^2 = - log r * sigma^2
-                    # -> (Vb - Vc)^2 = log(1/r) * sigma^2
-                    # -> Vb - Vc = sqrt(log(1/r) * sigma^2)
-                    # -> Vb = Vc + sqrt(log(1/r) * sigma^2)
-                # curr_base_vel_x = curr_cmd_vel_x + torch.sqrt(torch.log(1/curr_rews) * sigma**2)
-                # print("curr_cmd_vel_x: ", curr_cmd_vel_x)
-                # print("curr_rews: ", curr_rews)
-                # print("sigma: ", sigma)
-                # print("curr_base_vel_x: ", curr_base_vel_x)
-
             self.current_learning_iteration = it
             # log info
             if self.log_dir is not None and not self.disable_logs:
@@ -623,6 +496,41 @@ class OnPolicyRunner:
                 expert_utilization = self.alg.policy.get_expert_utilization()
                 for i, count in enumerate(expert_utilization):
                     self.writer.add_scalar(f"MoE/expert_{i}_count", count.item(), locs["it"])
+
+                # Per-expert curriculum progress (mean obstacle height)
+                # We compute this globally across all envs each PPO iteration.
+                try:
+                    pure_env = locs.get("pure_env", None)
+                    if pure_env is not None and hasattr(pure_env, "obstacle_height_list"):
+                        # Inter-obstacle spacing along -Y used to encode curriculum level.
+                        inter_obstacle_spacing_y = 2.0
+                        env_origins = pure_env.scene.env_origins  # (num_envs, 3)
+                        level = (-env_origins[:, 1] / inter_obstacle_spacing_y).clamp(min=0.0)
+                        level_idx = level.long()
+
+                        all_heights = torch.as_tensor(
+                            pure_env.obstacle_height_list, device=env_origins.device, dtype=torch.float32
+                        )
+                        level_idx = level_idx.clamp(min=0, max=all_heights.numel() - 1)
+                        obstacle_heights = all_heights[level_idx]  # (num_envs,)
+
+                        # Expert assignment per env:
+                        expert_ids = self.alg.policy.current_expert_indices
+
+                        if expert_ids is not None:
+                            expert_ids = expert_ids.to(env_origins.device).long()
+                            for expert_id in range(self.alg.policy.num_experts):
+                                mask = expert_ids == expert_id
+                                if mask.any():
+                                    mean_h = obstacle_heights[mask].mean()
+                                    self.writer.add_scalar(
+                                        f"MoE/curriculum_mean_obstacle_height/expert_{expert_id}",
+                                        mean_h.item(),
+                                        locs["it"],
+                                    )
+                except Exception as e:
+                    # Never break training due to logging; keep it quiet unless debugging.
+                    pass
             # everything else
             self.writer.add_scalar("Train/mean_reward", statistics.mean(locs["rewbuffer"]), locs["it"])
             self.writer.add_scalar("Train/mean_episode_length", statistics.mean(locs["lenbuffer"]), locs["it"])

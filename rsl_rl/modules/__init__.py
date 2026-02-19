@@ -10,6 +10,7 @@ from .actor_critic_recurrent import ActorCriticRecurrent
 from .moe_actor_critic import MoEActorCritic
 from .normalizer import EmpiricalNormalization
 from .rnd import RandomNetworkDistillation
+from .specialist_actor_critic import SpecialistActorCritic
 from .student_teacher import StudentTeacher
 from .student_teacher_recurrent import StudentTeacherRecurrent
 
@@ -19,6 +20,7 @@ __all__ = [
     "EmpiricalNormalization",
     "MoEActorCritic",
     "RandomNetworkDistillation",
+    "SpecialistActorCritic",
     "StudentTeacher",
     "StudentTeacherRecurrent",
 ]
