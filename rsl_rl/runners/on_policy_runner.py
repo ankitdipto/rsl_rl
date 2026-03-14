@@ -373,7 +373,14 @@ class OnPolicyRunner:
             # Compare and save the best checkpoint so far
             try:
                 # curr_reward = statistics.mean(rewbuffer)
-                curr_crclm_level = infos["log"].get("Curriculum/obstacle_height_levels_custom", -1)
+                curriculum_name = None
+                if "Curriculum/ramp_height_levels" in infos["log"]:
+                    curriculum_name = "ramp_height_levels"
+                elif "Curriculum/obstacle_height_levels_custom" in infos["log"]:
+                    curriculum_name = "obstacle_height_levels_custom"
+
+                assert curriculum_name is not None, "Curriculum name not found"
+                curr_crclm_level = infos["log"].get(f"Curriculum/{curriculum_name}", -1)
                 if curr_crclm_level > best_crclm_level:
                     best_crclm_level = curr_crclm_level
                     best_checkpoint = {
