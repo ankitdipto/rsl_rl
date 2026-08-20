@@ -179,6 +179,7 @@ class MoEActorCritic(nn.Module):
         self._last_gate_logits: torch.Tensor | None = None
         
         print(f"MoE Actor-Critic initialized:")
+        print(f"  Routing type: {self.routing_type}")
         print(f"  Gate: {self.gate}")
         print(f"  Num experts: {num_experts}")
         print(f"  Full obs dim: {num_actor_obs} (base: {self.num_base_obs}, morph: {num_morphology_obs})")
@@ -623,8 +624,6 @@ class MoEActorCritic(nn.Module):
             # Deterministic selection via argmax (efficient - only runs selected expert)
             gate_logits = self.gate(morphology)
             expert_indices = gate_logits.argmax(dim=-1)
-            # I want to force expert 2 for now
-            expert_indices = torch.full_like(expert_indices, 3)
             
             # Track expert indices for logging
             if self.current_expert_indices is not None and expert_indices.shape[0] == self.current_expert_indices.shape[0]:

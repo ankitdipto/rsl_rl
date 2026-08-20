@@ -129,6 +129,12 @@ class PPO:
             self.moe_cfg = None
         
         if self.use_moe:
+            cfg_routing = self.moe_cfg["routing_type"]
+            if cfg_routing != policy.routing_type:
+                raise ValueError(
+                    f"MoE routing_type mismatch: policy={policy.routing_type!r}, "
+                    f"algorithm.moe_cfg={cfg_routing!r}. They must match."
+                )
             print(f"MoE policy detected with {policy.num_experts} experts")
             print(f"  Routing type: {self.moe_cfg['routing_type']}")
             print(f"  Morphology obs dim: {self.moe_cfg['num_morphology_obs']}")
